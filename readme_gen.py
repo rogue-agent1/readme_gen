@@ -1,191 +1,234 @@
 #!/usr/bin/env python3
-"""readme_gen - Generate README.md from project structure and docstrings.
+"""readme_gen — Generate README.md files from project analysis.
 
-One file. Zero deps. Instant docs.
+Detects language, dependencies, scripts, and generates structured README.
 
 Usage:
-  readme_gen.py .                      → generate README for current dir
-  readme_gen.py . --style minimal      → short README
-  readme_gen.py . --style full         → detailed README
-  readme_gen.py . -o README.md         → write to file
-  readme_gen.py . --license MIT        → include license badge
+    readme_gen.py generate .
+    readme_gen.py generate . --style minimal
+    readme_gen.py generate . --style detailed
+    readme_gen.py badge . --badges ci,license,version
 """
 
-import argparse
-import ast
-import glob
-import json
-import os
-import re
 import sys
+import os
+import json
+import argparse
+import subprocess
+from pathlib import Path
 
 
-LICENSES = {
-    "MIT": "[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)",
-    "Apache-2.0": "[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)",
-    "GPL-3.0": "[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)",
-}
-
-LANG_INSTALL = {
-    "python": "```bash\npython {main_file}\n```",
-    "node": "```bash\nnpm install\nnode {main_file}\n```",
-    "rust": "```bash\ncargo build --release\n```",
-    "go": "```bash\ngo build\n```",
-}
-
-
-def detect_language(path: str) -> tuple[str, str]:
-    if os.path.exists(os.path.join(path, "Cargo.toml")):
-        return "rust", "Rust"
-    if os.path.exists(os.path.join(path, "go.mod")):
-        return "go", "Go"
-    if os.path.exists(os.path.join(path, "package.json")):
-        return "node", "Node.js"
-    py_files = glob.glob(os.path.join(path, "*.py"))
-    if py_files:
-        return "python", "Python"
-    return "unknown", "Unknown"
-
-
-def get_python_info(path: str) -> dict:
-    info = {"docstring": "", "functions": [], "classes": [], "main_file": ""}
-    for py in sorted(glob.glob(os.path.join(path, "*.py"))):
+def detect_project(directory):
+    """Analyze project directory."""
+    info = {
+        'name': os.path.basename(os.path.abspath(directory)),
+        'languages': [],
+        'files': [],
+        'has_tests': False,
+        'has_ci': False,
+        'has_docker': False,
+        'has_license': False,
+        'scripts': {},
+        'description': '',
+        'dependencies': 0,
+    }
+    
+    files = os.listdir(directory)
+    info['files'] = files
+    
+    # Detect language
+    if 'package.json' in files:
+        info['languages'].append('JavaScript/Node.js')
         try:
-            with open(py) as f:
-                tree = ast.parse(f.read())
-            ds = ast.get_docstring(tree)
-            if ds and not info["docstring"]:
-                info["docstring"] = ds
-                info["main_file"] = os.path.basename(py)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
-                    doc = ast.get_docstring(node) or ""
-                    info["functions"].append({"name": node.name, "doc": doc.split("\n")[0]})
-                elif isinstance(node, ast.ClassDef):
-                    doc = ast.get_docstring(node) or ""
-                    info["classes"].append({"name": node.name, "doc": doc.split("\n")[0]})
-        except (SyntaxError, ValueError):
-            continue
+            with open(os.path.join(directory, 'package.json')) as f:
+                pkg = json.load(f)
+            info['name'] = pkg.get('name', info['name'])
+            info['description'] = pkg.get('description', '')
+            info['scripts'] = pkg.get('scripts', {})
+            deps = len(pkg.get('dependencies', {})) + len(pkg.get('devDependencies', {}))
+            info['dependencies'] = deps
+        except (json.JSONDecodeError, KeyError):
+            pass
+    
+    if 'pyproject.toml' in files or 'setup.py' in files or 'requirements.txt' in files:
+        info['languages'].append('Python')
+    
+    if 'go.mod' in files:
+        info['languages'].append('Go')
+    
+    if 'Cargo.toml' in files:
+        info['languages'].append('Rust')
+    
+    if 'Makefile' in files:
+        info['has_makefile'] = True
+    
+    # Detect features
+    info['has_tests'] = any(f.startswith('test') or f == 'tests' for f in files)
+    info['has_ci'] = '.github' in files or '.gitlab-ci.yml' in files
+    info['has_docker'] = 'Dockerfile' in files or 'docker-compose.yml' in files
+    info['has_license'] = 'LICENSE' in files or 'LICENSE.md' in files
+    
+    # Get git remote for badges
+    try:
+        remote = subprocess.run(
+            ['git', 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, cwd=directory
+        ).stdout.strip()
+        if 'github.com' in remote:
+            # Extract owner/repo
+            m = __import__('re').search(r'github\.com[:/](.+?)(?:\.git)?$', remote)
+            if m:
+                info['github'] = m.group(1)
+    except Exception:
+        pass
+    
     return info
 
 
-def get_project_name(path: str) -> str:
-    abs_path = os.path.abspath(path)
-    # Check package.json
-    pkg = os.path.join(abs_path, "package.json")
-    if os.path.exists(pkg):
-        try:
-            with open(pkg) as f:
-                return json.load(f).get("name", "")
-        except Exception:
-            pass
-    return os.path.basename(abs_path)
-
-
-def count_files(path: str) -> dict:
-    counts = {}
-    for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")]
-        for f in files:
-            ext = os.path.splitext(f)[1]
-            if ext:
-                counts[ext] = counts.get(ext, 0) + 1
-    return dict(sorted(counts.items(), key=lambda x: -x[1])[:10])
-
-
-def generate(path: str, style: str = "standard", license_type: str = None) -> str:
-    name = get_project_name(path)
-    lang_key, lang_name = detect_language(path)
+def generate_readme(info, style='standard'):
     lines = []
-
-    # Title
-    lines.append(f"# {name}\n")
-
-    # License badge
-    if license_type and license_type in LICENSES:
-        lines.append(LICENSES[license_type] + "\n")
-
-    # Description from docstring
-    py_info = get_python_info(path) if lang_key == "python" else {}
-    docstring = py_info.get("docstring", "")
-    if docstring:
-        # First line is usually "tool - description"
-        first_line = docstring.split("\n")[0]
-        if " - " in first_line:
-            desc = first_line.split(" - ", 1)[1]
-        else:
-            desc = first_line
-        lines.append(f"{desc}\n")
-
-    # Usage from docstring
-    if docstring and "Usage:" in docstring:
-        usage_section = docstring[docstring.index("Usage:"):]
-        lines.append("## Usage\n")
-        lines.append(f"```\n{usage_section.strip()}\n```\n")
-    elif lang_key in LANG_INSTALL:
-        main = py_info.get("main_file", "") or f"{name}.py"
-        lines.append("## Usage\n")
-        lines.append(LANG_INSTALL[lang_key].format(main_file=main) + "\n")
-
-    if style == "full":
-        # File structure
-        files = count_files(path)
-        if files:
-            lines.append("## Structure\n")
-            for ext, count in files.items():
-                lines.append(f"- `{ext}`: {count} file{'s' if count > 1 else ''}")
-            lines.append("")
-
-        # API (functions/classes)
-        if py_info.get("functions") or py_info.get("classes"):
-            lines.append("## API\n")
-            for cls in py_info.get("classes", []):
-                doc = f" — {cls['doc']}" if cls['doc'] else ""
-                lines.append(f"### `{cls['name']}`{doc}\n")
-            for fn in py_info.get("functions", [])[:20]:
-                doc = f" — {fn['doc']}" if fn['doc'] else ""
-                lines.append(f"- `{fn['name']}()`{doc}")
-            lines.append("")
-
-    # Requirements
-    req = os.path.join(path, "requirements.txt")
-    if os.path.exists(req):
-        with open(req) as f:
-            deps = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        if deps:
-            lines.append("## Requirements\n")
-            for d in deps:
-                lines.append(f"- `{d}`")
-            lines.append("")
-    elif lang_key == "python" and not any("requirements" in f for f in os.listdir(path)):
-        lines.append("## Requirements\n")
-        lines.append("Python 3.8+ (no external dependencies)\n")
-
+    name = info['name']
+    desc = info['description']
+    
+    lines.append(f'# {name}\n')
+    
+    if desc:
+        lines.append(f'{desc}\n')
+    else:
+        lines.append('TODO: Add project description\n')
+    
+    # Badges
+    if info.get('github'):
+        gh = info['github']
+        if info['has_ci']:
+            lines.append(f'![CI](https://github.com/{gh}/actions/workflows/ci.yml/badge.svg)')
+        lines.append(f'![License](https://img.shields.io/github/license/{gh})')
+        lines.append('')
+    
+    # Languages
+    if info['languages']:
+        lines.append(f'**Built with:** {", ".join(info["languages"])}\n')
+    
+    if style != 'minimal':
+        # Prerequisites
+        lines.append('## Prerequisites\n')
+        for lang in info['languages']:
+            if 'Python' in lang:
+                lines.append('- Python 3.8+')
+            elif 'Node' in lang:
+                lines.append('- Node.js 18+')
+            elif 'Go' in lang:
+                lines.append('- Go 1.21+')
+            elif 'Rust' in lang:
+                lines.append('- Rust (stable)')
+        lines.append('')
+    
+    # Installation
+    lines.append('## Installation\n')
+    lines.append('```bash')
+    if info.get('github'):
+        lines.append(f'git clone https://github.com/{info["github"]}.git')
+        lines.append(f'cd {name}')
+    
+    if 'Python' in ' '.join(info['languages']):
+        lines.append('pip install -e .')
+    elif 'JavaScript' in ' '.join(info['languages']):
+        lines.append('npm install')
+    elif 'Go' in ' '.join(info['languages']):
+        lines.append(f'go build -o {name} .')
+    elif 'Rust' in ' '.join(info['languages']):
+        lines.append('cargo build --release')
+    else:
+        lines.append('# TODO: add install steps')
+    lines.append('```\n')
+    
+    # Usage
+    lines.append('## Usage\n')
+    lines.append('```bash')
+    if info['scripts']:
+        for name_s, cmd in list(info['scripts'].items())[:5]:
+            lines.append(f'npm run {name_s}  # {cmd}')
+    else:
+        lines.append('# TODO: add usage examples')
+    lines.append('```\n')
+    
+    if style == 'detailed':
+        # Project structure
+        lines.append('## Project Structure\n')
+        lines.append('```')
+        for f in sorted(info['files'])[:15]:
+            if not f.startswith('.'):
+                lines.append(f'├── {f}')
+        lines.append('```\n')
+        
+        if info['has_tests']:
+            lines.append('## Testing\n')
+            lines.append('```bash')
+            if 'Python' in ' '.join(info['languages']):
+                lines.append('pytest')
+            elif 'JavaScript' in ' '.join(info['languages']):
+                lines.append('npm test')
+            elif 'Go' in ' '.join(info['languages']):
+                lines.append('go test ./...')
+            lines.append('```\n')
+    
     # License
-    if license_type:
-        lines.append(f"## License\n")
-        lines.append(f"{license_type}\n")
+    if info['has_license']:
+        lines.append('## License\n')
+        lines.append('See [LICENSE](LICENSE) for details.\n')
+    
+    return '\n'.join(lines)
 
-    return "\n".join(lines)
+
+def cmd_generate(args):
+    info = detect_project(args.directory)
+    readme = generate_readme(info, style=args.style)
+    
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(readme)
+        print(f'Written to {args.output}')
+    else:
+        print(readme)
+
+
+def cmd_badge(args):
+    info = detect_project(args.directory)
+    gh = info.get('github', 'owner/repo')
+    
+    badges = {
+        'ci': f'![CI](https://github.com/{gh}/actions/workflows/ci.yml/badge.svg)',
+        'license': f'![License](https://img.shields.io/github/license/{gh})',
+        'version': f'![Version](https://img.shields.io/github/v/release/{gh})',
+        'issues': f'![Issues](https://img.shields.io/github/issues/{gh})',
+        'stars': f'![Stars](https://img.shields.io/github/stars/{gh})',
+        'forks': f'![Forks](https://img.shields.io/github/forks/{gh})',
+    }
+    
+    requested = args.badges.split(',') if args.badges else list(badges.keys())
+    for name in requested:
+        if name in badges:
+            print(badges[name])
 
 
 def main():
-    p = argparse.ArgumentParser(description="Generate README.md from project structure")
-    p.add_argument("path", default=".", nargs="?")
-    p.add_argument("--style", choices=["minimal", "standard", "full"], default="standard")
-    p.add_argument("--license", dest="license_type")
-    p.add_argument("-o", "--output")
+    p = argparse.ArgumentParser(description='README.md generator')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    s = sub.add_parser('generate', help='Generate README')
+    s.add_argument('directory', default='.')
+    s.add_argument('--style', choices=['minimal', 'standard', 'detailed'], default='standard')
+    s.add_argument('--output', '-o')
+    s.set_defaults(func=cmd_generate)
+
+    s = sub.add_parser('badge', help='Generate badge markdown')
+    s.add_argument('directory', default='.')
+    s.add_argument('--badges', help='Comma-separated badge names')
+    s.set_defaults(func=cmd_badge)
+
     args = p.parse_args()
-
-    readme = generate(args.path, args.style, args.license_type)
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(readme)
-        print(f"Wrote {args.output}")
-    else:
-        print(readme)
-    return 0
+    args.func(args)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()
